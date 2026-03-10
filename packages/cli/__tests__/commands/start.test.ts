@@ -694,6 +694,25 @@ describe("start command — orchestrator session strategy display", () => {
       expect(output).not.toContain("reused existing session");
     },
   );
+
+  it("shows process runtime details when the orchestrator is not using tmux", async () => {
+    mockConfigRef.current = makeConfig({ "my-app": makeProject({ runtime: "process" }) });
+
+    mockSessionManager.get.mockResolvedValue({
+      id: "app-orchestrator",
+      runtimeHandle: { id: "proc-1", runtimeName: "process", data: { pid: 4242 } },
+    });
+    mockSessionManager.spawnOrchestrator.mockResolvedValue({
+      id: "app-orchestrator",
+      runtimeHandle: { id: "proc-1", runtimeName: "process", data: { pid: 4242 } },
+    });
+
+    await program.parseAsync(["node", "test", "start", "--no-dashboard"]);
+
+    const output = getLoggedOutput();
+    expect(output).toContain("process runtime (PID 4242)");
+    expect(output).not.toContain("tmux attach -t");
+  });
 });
 
 // ---------------------------------------------------------------------------
