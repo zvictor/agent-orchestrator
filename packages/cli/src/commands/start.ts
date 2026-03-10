@@ -28,6 +28,7 @@ import {
   type OrchestratorConfig,
   type ProjectConfig,
   type ParsedRepoUrl,
+  type RuntimeHandle,
 } from "@composio/ao-core";
 import { exec, execSilent } from "../lib/shell.js";
 import { getSessionManager } from "../lib/create-session-manager.js";
@@ -42,6 +43,7 @@ import {
 } from "../lib/web-dir.js";
 import { cleanNextCache } from "../lib/dashboard-rebuild.js";
 import { preflight } from "../lib/preflight.js";
+import { formatAttachHint } from "../lib/attach-hint.js";
 
 const DEFAULT_PORT = 3000;
 
@@ -334,7 +336,7 @@ async function runStartup(
   }
 
   // Create orchestrator session (unless --no-orchestrator or already exists)
-  let tmuxTarget = sessionId;
+  let runtimeHandle: RuntimeHandle | null = null;
   if (opts?.orchestrator !== false) {
     const sm = await getSessionManager(config);
 
@@ -342,9 +344,7 @@ async function runStartup(
       spinner.start("Creating orchestrator session");
       const systemPrompt = generateOrchestratorPrompt({ config, projectId, project });
       const session = await sm.spawnOrchestrator({ projectId, systemPrompt });
-      if (session.runtimeHandle?.id) {
-        tmuxTarget = session.runtimeHandle.id;
-      }
+      runtimeHandle = session.runtimeHandle ?? null;
       reused =
         orchestratorSessionStrategy === "reuse" &&
         session.metadata?.["orchestratorSessionReused"] === "true";
@@ -377,7 +377,7 @@ async function runStartup(
   }
 
   if (opts?.orchestrator !== false && !reused) {
-    console.log(chalk.cyan("Orchestrator:"), `tmux attach -t ${tmuxTarget}`);
+    console.log(chalk.cyan("Orchestrator:"), formatAttachHint(runtimeHandle, sessionId));
   } else if (reused) {
     console.log(chalk.cyan("Orchestrator:"), `reused existing session (${sessionId})`);
   }
