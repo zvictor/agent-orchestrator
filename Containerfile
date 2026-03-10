@@ -64,6 +64,6 @@ RUN /usr/local/bin/install-coding-agents "$AO_INSTALL_AGENTS"
 
 EXPOSE 3000 14800 14801
 
-VOLUME ["/root/.agent-orchestrator", "/app/projects"]
+VOLUME ["/root/.agent-orchestrator", "/projects"]
 
 ENTRYPOINT ["/usr/local/bin/ao-entrypoint"]

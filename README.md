@@ -79,7 +79,7 @@ cd agent-orchestrator
 mkdir -p projects
 cp agent-orchestrator.yaml.example agent-orchestrator.yaml
 # edit agent-orchestrator.yaml:
-# - set the project path to ./projects/your-repo
+# - set the project path to /projects/your-repo
 # - set defaults.runtime to process (or your preferred runtime)
 docker compose up --build
 ```
@@ -157,7 +157,25 @@ See [`agent-orchestrator.yaml.example`](agent-orchestrator.yaml.example) for the
 
 Use the root [compose.yaml](compose.yaml) and [Containerfile](Containerfile).
 
-- `compose.yaml` mounts `./projects` into the container at `./projects`, so project paths in config can stay relative, for example `./projects/your-repo`.
+- Path mapping matters:
+  - `AO_PROJECTS_DIR` defaults to `./projects` on the host
+  - regardless of the host directory name, compose mounts it at `/projects` inside the container
+  - `agent-orchestrator.yaml` must use the container path, not the host path
+- Example:
+
+```yaml
+projects:
+  my-app:
+    repo: your-org/my-app
+    path: /projects/my-app
+    defaultBranch: main
+```
+
+Examples:
+
+- host `./projects/my-app` -> container `/projects/my-app`
+- host `./somewhere/else/my-app` with `AO_PROJECTS_DIR=./somewhere/else` -> container `/projects/my-app`
+
 - Set `AO_PROJECT` if your config contains more than one project and you want the container to start a specific one by default.
 - Set `AO_INSTALL_AGENTS` before `docker compose build` or `podman compose build` to control which CLIs are baked into the image. Default: `claude-code,codex,aider,goose`.
 - For GitHub issue/PR workflows, point `GH_CONFIG_DIR` at a host directory with `gh auth login` state.
