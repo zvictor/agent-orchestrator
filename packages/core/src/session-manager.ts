@@ -28,7 +28,6 @@ import {
   type SessionId,
   type SessionSpawnConfig,
   type OrchestratorSpawnConfig,
-  type SessionStatus,
   type CleanupResult,
   type ClaimPROptions,
   type ClaimPRResult,
@@ -65,6 +64,14 @@ import {
 } from "./paths.js";
 import { asValidOpenCodeSessionId } from "./opencode-session-id.js";
 import { normalizeOrchestratorSessionStrategy } from "./orchestrator-session-strategy.js";
+import {
+  GLOBAL_PAUSE_REASON_KEY,
+  GLOBAL_PAUSE_SOURCE_KEY,
+  GLOBAL_PAUSE_UNTIL_KEY,
+  parsePauseUntil,
+} from "./global-pause.js";
+import { sessionFromMetadata } from "./utils/session-from-metadata.js";
+import { safeJsonParse } from "./utils/validation.js";
 
 const execFileAsync = promisify(execFile);
 const OPENCODE_DISCOVERY_TIMEOUT_MS = 2_000;
@@ -185,35 +192,6 @@ function getNextSessionNumber(existingSessions: string[], prefix: string): numbe
   return max + 1;
 }
 
-/** Safely parse JSON, returning null on failure. */
-function safeJsonParse<T>(str: string): T | null {
-  try {
-    return JSON.parse(str) as T;
-  } catch {
-    return null;
-  }
-}
-
-/** Valid session statuses for validation. */
-const VALID_STATUSES: ReadonlySet<string> = new Set([
-  "spawning",
-  "working",
-  "pr_open",
-  "ci_failed",
-  "review_pending",
-  "changes_requested",
-  "approved",
-  "mergeable",
-  "merged",
-  "cleanup",
-  "needs_input",
-  "stuck",
-  "errored",
-  "killed",
-  "done",
-  "terminated",
-]);
-
 const PR_TRACKING_STATUSES: ReadonlySet<string> = new Set([
   "pr_open",
   "ci_failed",
@@ -233,14 +211,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Validate and normalize a status string. */
-function validateStatus(raw: string | undefined): SessionStatus {
-  // Bash scripts write "starting" — treat as "working"
-  if (raw === "starting") return "working";
-  if (raw && VALID_STATUSES.has(raw)) return raw as SessionStatus;
-  return "spawning";
-}
-
 /** Reconstruct a Session object from raw metadata key=value pairs. */
 function metadataToSession(
   sessionId: SessionId,
@@ -248,42 +218,10 @@ function metadataToSession(
   createdAt?: Date,
   modifiedAt?: Date,
 ): Session {
-  return {
-    id: sessionId,
-    projectId: meta["project"] ?? "",
-    status: validateStatus(meta["status"]),
-    activity: null,
-    branch: meta["branch"] || null,
-    issueId: meta["issue"] || null,
-    pr: meta["pr"]
-      ? (() => {
-          // Parse owner/repo from GitHub PR URL: https://github.com/owner/repo/pull/123
-          const prUrl = meta["pr"];
-          const ghMatch = prUrl.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-          return {
-            number: ghMatch
-              ? parseInt(ghMatch[3], 10)
-              : parseInt(prUrl.match(/\/(\d+)$/)?.[1] ?? "0", 10),
-            url: prUrl,
-            title: "",
-            owner: ghMatch?.[1] ?? "",
-            repo: ghMatch?.[2] ?? "",
-            branch: meta["branch"] ?? "",
-            baseBranch: "",
-            isDraft: false,
-          };
-        })()
-      : null,
-    workspacePath: meta["worktree"] || null,
-    runtimeHandle: meta["runtimeHandle"]
-      ? safeJsonParse<RuntimeHandle>(meta["runtimeHandle"])
-      : null,
-    agentInfo: meta["summary"] ? { summary: meta["summary"], agentSessionId: null } : null,
-    createdAt: meta["createdAt"] ? new Date(meta["createdAt"]) : (createdAt ?? new Date()),
+  return sessionFromMetadata(sessionId, meta, {
+    createdAt,
     lastActivityAt: modifiedAt ?? new Date(),
-    restoredAt: meta["restoredAt"] ? new Date(meta["restoredAt"]) : undefined,
-    metadata: meta,
-  };
+  });
 }
 
 export interface SessionManagerDeps {
@@ -307,6 +245,27 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
    */
   function getProjectSessionsDir(project: ProjectConfig): string {
     return getSessionsDir(config.configPath, project.path);
+  }
+
+  function getProjectPause(project: ProjectConfig): {
+    until: Date;
+    reason: string;
+    sourceSessionId: string;
+  } | null {
+    const sessionsDir = getProjectSessionsDir(project);
+    const orchestratorId = `${project.sessionPrefix}-orchestrator`;
+    const orchestratorRaw = readMetadataRaw(sessionsDir, orchestratorId);
+    if (!orchestratorRaw) return null;
+
+    const until = parsePauseUntil(orchestratorRaw[GLOBAL_PAUSE_UNTIL_KEY]);
+    if (!until) return null;
+    if (until.getTime() <= Date.now()) return null;
+
+    return {
+      until,
+      reason: orchestratorRaw[GLOBAL_PAUSE_REASON_KEY] ?? "Model rate limit reached",
+      sourceSessionId: orchestratorRaw[GLOBAL_PAUSE_SOURCE_KEY] ?? "unknown",
+    };
   }
 
   function normalizePath(path: string): string {
@@ -644,6 +603,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       throw new Error(`Unknown project: ${spawnConfig.projectId}`);
     }
 
+    const pause = getProjectPause(project);
+    if (pause) {
+      throw new Error(
+        `Project is paused due to model rate limit until ${pause.until.toISOString()} (${pause.reason}; source: ${pause.sourceSessionId})`,
+      );
+    }
+
     const plugins = resolvePlugins(project);
     if (!plugins.runtime) {
       throw new Error(`Runtime plugin '${project.runtime ?? config.defaults.runtime}' not found`);
@@ -791,6 +757,8 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       issueId: spawnConfig.issueId,
       issueContext,
       userPrompt: spawnConfig.prompt,
+      lineage: spawnConfig.lineage,
+      siblings: spawnConfig.siblings,
     });
 
     // Get agent launch config and create runtime — clean up workspace on failure
@@ -964,6 +932,13 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       throw new Error(`Unknown project: ${orchestratorConfig.projectId}`);
     }
 
+    const pause = getProjectPause(project);
+    if (pause) {
+      throw new Error(
+        `Project is paused due to model rate limit until ${pause.until.toISOString()} (${pause.reason}; source: ${pause.sourceSessionId})`,
+      );
+    }
+
     const plugins = resolvePlugins(project);
     if (!plugins.runtime) {
       throw new Error(`Runtime plugin '${project.runtime ?? config.defaults.runtime}' not found`);
@@ -1008,17 +983,65 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       writeFileSync(systemPromptFile, orchestratorConfig.systemPrompt, "utf-8");
     }
 
-    const existingOrchestrator = await get(sessionId);
+    const existingRaw = readMetadataRaw(sessionsDir, sessionId);
+    const existingOrchestrator = existingRaw?.["runtimeHandle"]
+      ? metadataToSession(sessionId, existingRaw)
+      : null;
     if (existingOrchestrator?.runtimeHandle) {
       const existingAlive = await plugins.runtime
         .isAlive(existingOrchestrator.runtimeHandle)
         .catch(() => false);
       if (existingAlive && orchestratorSessionStrategy === "reuse") {
-        existingOrchestrator.metadata["orchestratorSessionReused"] = "true";
-        return existingOrchestrator;
+        const persistedRaw = readMetadataRaw(sessionsDir, sessionId);
+        if (persistedRaw?.["runtimeHandle"]) {
+          const persisted = metadataToSession(sessionId, persistedRaw);
+          persisted.metadata["orchestratorSessionReused"] = "true";
+          return persisted;
+        }
+        await plugins.runtime.destroy(existingOrchestrator.runtimeHandle).catch(() => undefined);
+        deleteMetadata(sessionsDir, sessionId, false);
       }
       if (existingAlive && orchestratorSessionStrategy !== "reuse") {
         await plugins.runtime.destroy(existingOrchestrator.runtimeHandle).catch(() => undefined);
+        // Destroy runtime and delete metadata without archive for ignore strategy
+        deleteMetadata(sessionsDir, sessionId, false);
+      }
+      // For dead runtime, delete metadata so reserveSessionId can succeed:
+      // - With reuse strategy + opencode: archive to preserve opencodeSessionId for reuse lookup
+      // - With non-reuse strategy: delete without archive to respawn fresh
+      if (!existingAlive) {
+        deleteMetadata(sessionsDir, sessionId, orchestratorSessionStrategy === "reuse");
+      }
+    }
+
+    // Atomically reserve the session ID before creating any resources.
+    // This prevents race conditions where concurrent spawnOrchestrator calls
+    // both see no existing session and proceed to create duplicate runtimes.
+    let reserved = reserveSessionId(sessionsDir, sessionId);
+    if (!reserved) {
+      // Reservation failed - another process reserved it first.
+      // Check if the session now exists and is alive.
+      const concurrentRaw = readMetadataRaw(sessionsDir, sessionId);
+      const concurrentSession = concurrentRaw?.["runtimeHandle"]
+        ? metadataToSession(sessionId, concurrentRaw)
+        : null;
+      if (concurrentSession?.runtimeHandle) {
+        const concurrentAlive = await plugins.runtime
+          .isAlive(concurrentSession.runtimeHandle)
+          .catch(() => false);
+        if (concurrentAlive && orchestratorSessionStrategy === "reuse") {
+          concurrentSession.metadata["orchestratorSessionReused"] = "true";
+          return concurrentSession;
+        }
+        if (!concurrentAlive) {
+          deleteMetadata(sessionsDir, sessionId, orchestratorSessionStrategy === "reuse");
+          reserved = reserveSessionId(sessionsDir, sessionId);
+        }
+      } else {
+        reserved = reserveSessionId(sessionsDir, sessionId);
+      }
+      if (!reserved) {
+        throw new Error(`Session ${sessionId} already exists but is not in a reusable state`);
       }
     }
 
@@ -1479,6 +1502,14 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
   async function send(sessionId: SessionId, message: string): Promise<void> {
     const { raw, sessionsDir, project } = requireSessionRecord(sessionId);
+    const pause = getProjectPause(project);
+    const orchestratorId = `${project.sessionPrefix}-orchestrator`;
+    if (pause && sessionId !== orchestratorId) {
+      throw new Error(
+        `Project is paused due to model rate limit until ${pause.until.toISOString()} (${pause.reason}; source: ${pause.sourceSessionId})`,
+      );
+    }
+
     const selectedAgent = raw["agent"] ?? project.agent ?? config.defaults.agent;
     if (selectedAgent === "opencode" && !asValidOpenCodeSessionId(raw["opencodeSessionId"])) {
       const discovered = await discoverOpenCodeSessionIdByTitle(
@@ -1717,11 +1748,6 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
     }
 
     const takenOverFrom = [...conflictingSessions];
-    if (takenOverFrom.length > 0 && !options?.takeover) {
-      throw new Error(
-        `PR #${pr.number} is already tracked by ${takenOverFrom.join(", ")}. Re-run with takeover enabled to transfer ownership.`,
-      );
-    }
 
     const workspacePath = raw["worktree"];
     if (!workspacePath) {

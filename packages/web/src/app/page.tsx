@@ -11,6 +11,7 @@ import {
 } from "@/lib/serialize";
 import { prCache, prCacheKey } from "@/lib/cache";
 import { getProjectName } from "@/lib/project-name";
+import { resolveGlobalPause, type GlobalPauseState } from "@/lib/global-pause";
 
 export const dynamic = "force-dynamic";
 
@@ -23,10 +24,14 @@ export async function generateMetadata(): Promise<Metadata> {
 export default async function Home() {
   let sessions: DashboardSession[] = [];
   let orchestratorId: string | null = null;
+  let globalPause: GlobalPauseState | null = null;
+  let projectIds: string[] = [];
   const projectName = getProjectName();
   try {
     const { config, registry, sessionManager } = await getServices();
+    projectIds = Object.keys(config.projects);
     const allSessions = await sessionManager.list();
+    globalPause = resolveGlobalPause(allSessions);
 
     // Find the orchestrator session (any session ending with -orchestrator)
     // Only set orchestratorId if an actual session exists (no fallback)
@@ -41,7 +46,10 @@ export default async function Home() {
 
     // Enrich metadata (issue labels, agent summaries, issue titles) — cap at 3s
     const metaTimeout = new Promise<void>((resolve) => setTimeout(resolve, 3_000));
-    await Promise.race([enrichSessionsMetadata(coreSessions, sessions, config, registry), metaTimeout]);
+    await Promise.race([
+      enrichSessionsMetadata(coreSessions, sessions, config, registry),
+      metaTimeout,
+    ]);
 
     // Enrich sessions that have PRs with live SCM data
     // Skip enrichment for terminal sessions (merged, closed, done, terminated)
@@ -101,6 +109,13 @@ export default async function Home() {
   }
 
   return (
-    <Dashboard initialSessions={sessions} stats={computeStats(sessions)} orchestratorId={orchestratorId} projectName={projectName} />
+    <Dashboard
+      initialSessions={sessions}
+      stats={computeStats(sessions)}
+      orchestratorId={orchestratorId}
+      projectName={projectName}
+      initialGlobalPause={globalPause}
+      projectIds={projectIds}
+    />
   );
 }

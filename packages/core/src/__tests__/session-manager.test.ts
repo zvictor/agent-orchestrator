@@ -4,7 +4,14 @@ import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { createSessionManager } from "../session-manager.js";
-import { writeMetadata, readMetadata, readMetadataRaw, deleteMetadata } from "../metadata.js";
+import {
+  writeMetadata,
+  readMetadata,
+  readMetadataRaw,
+  deleteMetadata,
+  reserveSessionId,
+  updateMetadata,
+} from "../metadata.js";
 import { getSessionsDir, getProjectBaseDir, getWorktreesDir } from "../paths.js";
 import {
   SessionNotRestorableError,
@@ -212,6 +219,29 @@ describe("spawn", () => {
     expect(mockAgent.getLaunchCommand).toHaveBeenCalled();
     // Verify runtime was created
     expect(mockRuntime.create).toHaveBeenCalled();
+  });
+
+  it("blocks spawn while the project is globally paused", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
+    });
+    updateMetadata(sessionsDir, "app-orchestrator", {
+      globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
+      globalPauseReason: "Rate limit reached",
+      globalPauseSource: "app-9",
+    });
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await expect(sm.spawn({ projectId: "my-app" })).rejects.toThrow(
+      "Project is paused due to model rate limit until",
+    );
+    expect(mockRuntime.create).not.toHaveBeenCalled();
   });
 
   it("uses issue ID to derive branch name", async () => {
@@ -2004,6 +2034,37 @@ describe("send", () => {
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(makeHandle("rt-1"), "Fix the CI failures");
   });
 
+  it("blocks send to worker sessions while the project is globally paused", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
+    });
+    updateMetadata(sessionsDir, "app-orchestrator", {
+      globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
+      globalPauseReason: "Rate limit reached",
+      globalPauseSource: "app-9",
+    });
+
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp",
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-1")),
+    });
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await expect(sm.send("app-1", "Fix the CI failures")).rejects.toThrow(
+      "Project is paused due to model rate limit until",
+    );
+    expect(mockRuntime.sendMessage).not.toHaveBeenCalled();
+  });
+
   it("restores a dead session before sending the message", async () => {
     const wsPath = join(tmpDir, "ws-app-1");
     mkdirSync(wsPath, { recursive: true });
@@ -2338,6 +2399,29 @@ describe("remap", () => {
 });
 
 describe("spawnOrchestrator", () => {
+  it("blocks orchestrator spawn while the project is globally paused", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-orchestrator")),
+    });
+    updateMetadata(sessionsDir, "app-orchestrator", {
+      globalPauseUntil: new Date(Date.now() + 60_000).toISOString(),
+      globalPauseReason: "Rate limit reached",
+      globalPauseSource: "app-9",
+    });
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await expect(sm.spawnOrchestrator({ projectId: "my-app" })).rejects.toThrow(
+      "Project is paused due to model rate limit until",
+    );
+    expect(mockRuntime.create).not.toHaveBeenCalled();
+  });
+
   it("creates orchestrator session with correct ID", async () => {
     const sm = createSessionManager({ config, registry: mockRegistry });
 
@@ -2545,6 +2629,66 @@ describe("spawnOrchestrator", () => {
     expect(existsSync(listLogPath)).toBe(false);
   });
 
+  it("destroys orphaned runtime when reuse strategy finds alive runtime but get returns null", async () => {
+    const deleteLogPath = join(tmpDir, "opencode-delete-orphaned-runtime.log");
+    const mockBin = installMockOpencode("[]", deleteLogPath);
+    process.env.PATH = `${mockBin}:${originalPath ?? ""}`;
+
+    const opencodeAgent: Agent = {
+      ...mockAgent,
+      name: "opencode",
+    };
+    const registryWithOpenCode: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return opencodeAgent;
+        if (slot === "workspace") return mockWorkspace;
+        return null;
+      }),
+    };
+
+    const configWithReuse: OrchestratorConfig = {
+      ...config,
+      defaults: { ...config.defaults, agent: "opencode" },
+      projects: {
+        ...config.projects,
+        "my-app": {
+          ...config.projects["my-app"],
+          agent: "opencode",
+          orchestratorSessionStrategy: "reuse",
+        },
+      },
+    };
+
+    const orphanedHandle = makeHandle("rt-orphaned");
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      agent: "opencode",
+      runtimeHandle: JSON.stringify(orphanedHandle),
+      createdAt: new Date().toISOString(),
+    });
+
+    vi.mocked(mockRuntime.isAlive).mockImplementation(async (handle: RuntimeHandle) => {
+      if (handle?.id === "rt-orphaned") {
+        deleteMetadata(sessionsDir, "app-orchestrator");
+        return true;
+      }
+      return false;
+    });
+
+    const sm = createSessionManager({ config: configWithReuse, registry: registryWithOpenCode });
+    const session = await sm.spawnOrchestrator({ projectId: "my-app" });
+
+    expect(session.id).toBe("app-orchestrator");
+    expect(mockRuntime.destroy).toHaveBeenCalledWith(orphanedHandle);
+    expect(mockRuntime.create).toHaveBeenCalled();
+  });
+
   it("reuses mapped OpenCode session id when strategy is reuse and runtime is restarted", async () => {
     const opencodeAgent: Agent = {
       ...mockAgent,
@@ -2602,6 +2746,16 @@ describe("spawnOrchestrator", () => {
   });
 
   it("reuses archived OpenCode mapping for orchestrator when active metadata has no mapping", async () => {
+    const deleteLogPath = join(tmpDir, "opencode-delete-orchestrator-reuse-archived.log");
+    const mockBin = installMockOpencode(
+      JSON.stringify([
+        null,
+        { id: "ses_existing", title: "AO:app-orchestrator", updated: 1_772_777_000_000 },
+      ]),
+      deleteLogPath,
+    );
+    process.env.PATH = `${mockBin}:${originalPath ?? ""}`;
+
     const opencodeAgent: Agent = {
       ...mockAgent,
       name: "opencode",
@@ -2846,6 +3000,27 @@ describe("spawnOrchestrator", () => {
     expect(meta?.["orchestratorSessionReused"]).toBeUndefined();
   });
 
+  it("respawns the orchestrator when stale metadata exists but the runtime is dead", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      project: "my-app",
+      role: "orchestrator",
+      runtimeHandle: JSON.stringify(makeHandle("rt-stale")),
+      createdAt: new Date().toISOString(),
+    });
+
+    vi.mocked(mockRuntime.isAlive).mockResolvedValue(false);
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await sm.spawnOrchestrator({ projectId: "my-app" });
+
+    expect(mockRuntime.create).toHaveBeenCalledTimes(1);
+    const meta = readMetadataRaw(sessionsDir, "app-orchestrator");
+    expect(meta?.["runtimeHandle"]).toBe(JSON.stringify(makeHandle("rt-1")));
+  });
+
   it("uses orchestratorModel when configured", async () => {
     const configWithOrchestratorModel: OrchestratorConfig = {
       ...config,
@@ -2946,6 +3121,103 @@ describe("spawnOrchestrator", () => {
     const session = await sm.spawnOrchestrator({ projectId: "my-app" });
 
     expect(session.runtimeHandle).toEqual(makeHandle("rt-1"));
+  });
+
+  it("reuses existing orchestrator on reservation conflict when strategy is reuse", async () => {
+    const opencodeAgent: Agent = {
+      ...mockAgent,
+      name: "opencode",
+    };
+    const registryWithOpenCode: PluginRegistry = {
+      ...mockRegistry,
+      get: vi.fn().mockImplementation((slot: string) => {
+        if (slot === "runtime") return mockRuntime;
+        if (slot === "agent") return opencodeAgent;
+        if (slot === "workspace") return mockWorkspace;
+        return null;
+      }),
+    };
+
+    const configWithReuse: OrchestratorConfig = {
+      ...config,
+      defaults: { ...config.defaults, agent: "opencode" },
+      projects: {
+        ...config.projects,
+        "my-app": {
+          ...config.projects["my-app"],
+          agent: "opencode",
+          orchestratorSessionStrategy: "reuse",
+        },
+      },
+    };
+
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      agent: "opencode",
+      runtimeHandle: JSON.stringify(makeHandle("rt-concurrent")),
+      opencodeSessionId: "ses_concurrent",
+      createdAt: new Date().toISOString(),
+    });
+
+    vi.mocked(mockRuntime.isAlive).mockResolvedValue(true);
+
+    const sm = createSessionManager({ config: configWithReuse, registry: registryWithOpenCode });
+    const session = await sm.spawnOrchestrator({ projectId: "my-app" });
+
+    expect(session.metadata["orchestratorSessionReused"]).toBe("true");
+    expect(mockRuntime.create).not.toHaveBeenCalled();
+  });
+
+  it("recovers reservation conflict when existing session is not usable", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "killed",
+      role: "orchestrator",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-dead")),
+      createdAt: new Date().toISOString(),
+    });
+
+    vi.mocked(mockRuntime.isAlive).mockResolvedValue(false);
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.spawnOrchestrator({ projectId: "my-app" })).resolves.toBeDefined();
+    expect(mockRuntime.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates only one runtime on reservation conflict", async () => {
+    writeMetadata(sessionsDir, "app-orchestrator", {
+      worktree: join(tmpDir, "my-app"),
+      branch: "main",
+      status: "working",
+      role: "orchestrator",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-existing")),
+      createdAt: new Date().toISOString(),
+    });
+
+    vi.mocked(mockRuntime.isAlive).mockResolvedValue(false);
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+    await expect(sm.spawnOrchestrator({ projectId: "my-app" })).resolves.toBeDefined();
+    expect(mockRuntime.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not delete an in-progress reservation file without runtime metadata", async () => {
+    expect(reserveSessionId(sessionsDir, "app-orchestrator")).toBe(true);
+
+    const sm = createSessionManager({ config, registry: mockRegistry });
+
+    await expect(sm.spawnOrchestrator({ projectId: "my-app" })).rejects.toThrow(
+      "already exists but is not in a reusable state",
+    );
+    expect(mockRuntime.create).not.toHaveBeenCalled();
+    expect(readMetadataRaw(sessionsDir, "app-orchestrator")).toEqual({});
   });
 });
 
@@ -3597,38 +3869,7 @@ describe("claimPR", () => {
     expect(raw!["prAutoDetect"]).toBeUndefined();
   });
 
-  it("supports takeover by disabling PR auto-detect on the previous session", async () => {
-    const mockSCM = makeSCM();
-
-    writeMetadata(sessionsDir, "app-1", {
-      worktree: "/tmp/ws-app-1",
-      branch: "feat/existing-pr",
-      status: "review_pending",
-      project: "my-app",
-      pr: "https://github.com/org/my-app/pull/42",
-      runtimeHandle: JSON.stringify(makeHandle("rt-1")),
-    });
-
-    writeMetadata(sessionsDir, "app-2", {
-      worktree: "/tmp/ws-app-2",
-      branch: "feat/other-work",
-      status: "working",
-      project: "my-app",
-      runtimeHandle: JSON.stringify(makeHandle("rt-2")),
-    });
-
-    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
-    const result = await sm.claimPR("app-2", "42", { takeover: true });
-
-    expect(result.takenOverFrom).toEqual(["app-1"]);
-
-    const previous = readMetadataRaw(sessionsDir, "app-1");
-    expect(previous!["pr"]).toBeUndefined();
-    expect(previous!["prAutoDetect"]).toBe("off");
-    expect(previous!["status"]).toBe("working");
-  });
-
-  it("rejects takeover when another session already tracks the PR", async () => {
+  it("automatically consolidates ownership when another session tracks the PR", async () => {
     const mockSCM = makeSCM();
 
     writeMetadata(sessionsDir, "app-1", {
@@ -3649,8 +3890,18 @@ describe("claimPR", () => {
     });
 
     const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+    const result = await sm.claimPR("app-2", "42");
 
-    await expect(sm.claimPR("app-2", "42")).rejects.toThrow("already tracked by app-1");
+    expect(result.takenOverFrom).toContain("app-1");
+    expect(result.pr.number).toBe(42);
+
+    const app2 = readMetadataRaw(sessionsDir, "app-2");
+    expect(app2!["pr"]).toBe("https://github.com/org/my-app/pull/42");
+    expect(app2!["status"]).toBe("pr_open");
+
+    const app1 = readMetadataRaw(sessionsDir, "app-1");
+    expect(app1!["pr"] ?? "").toBe("");
+    expect(app1!["status"]).toBe("working");
   });
 
   it("keeps AO metadata updated even if GitHub assignment fails", async () => {
@@ -3675,6 +3926,157 @@ describe("claimPR", () => {
     const raw = readMetadataRaw(sessionsDir, "app-2");
     expect(raw!["pr"]).toBe("https://github.com/org/my-app/pull/42");
     expect(raw!["status"]).toBe("pr_open");
+  });
+
+  // RULE B: One session may own multiple PRs sequentially (switching ownership)
+  it("allows same session to claim different PRs sequentially without rejection", async () => {
+    const mockSCM = makeSCM({
+      resolvePR: vi
+        .fn()
+        .mockResolvedValueOnce({
+          number: 42,
+          url: "https://github.com/org/my-app/pull/42",
+          title: "First PR",
+          owner: "org",
+          repo: "my-app",
+          branch: "feat/first-pr",
+          baseBranch: "main",
+          isDraft: false,
+        })
+        .mockResolvedValueOnce({
+          number: 99,
+          url: "https://github.com/org/my-app/pull/99",
+          title: "Second PR",
+          owner: "org",
+          repo: "my-app",
+          branch: "feat/second-pr",
+          baseBranch: "main",
+          isDraft: false,
+        }),
+      checkoutPR: vi.fn().mockResolvedValue(true),
+    });
+
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp/ws-app-1",
+      branch: "feat/initial",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-1")),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+
+    // Claim first PR
+    const result1 = await sm.claimPR("app-1", "42");
+    expect(result1.pr.number).toBe(42);
+    expect(result1.takenOverFrom).toEqual([]);
+
+    let raw = readMetadataRaw(sessionsDir, "app-1");
+    expect(raw!["pr"]).toBe("https://github.com/org/my-app/pull/42");
+
+    // Claim second PR (switches ownership, no rejection)
+    const result2 = await sm.claimPR("app-1", "99");
+    expect(result2.pr.number).toBe(99);
+    expect(result2.takenOverFrom).toEqual([]);
+
+    raw = readMetadataRaw(sessionsDir, "app-1");
+    expect(raw!["pr"]).toBe("https://github.com/org/my-app/pull/99");
+    expect(raw!["branch"]).toBe("feat/second-pr");
+  });
+
+  // Idempotent re-claim by same owner
+  it("handles idempotent re-claim of same PR by same session", async () => {
+    const mockSCM = makeSCM();
+
+    writeMetadata(sessionsDir, "app-1", {
+      worktree: "/tmp/ws-app-1",
+      branch: "feat/existing-pr",
+      status: "pr_open",
+      project: "my-app",
+      pr: "https://github.com/org/my-app/pull/42",
+      runtimeHandle: JSON.stringify(makeHandle("rt-1")),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+
+    // Re-claim same PR - should succeed without consolidation
+    const result = await sm.claimPR("app-1", "42");
+    expect(result.pr.number).toBe(42);
+    expect(result.takenOverFrom).toEqual([]);
+
+    const raw = readMetadataRaw(sessionsDir, "app-1");
+    expect(raw!["pr"]).toBe("https://github.com/org/my-app/pull/42");
+  });
+
+  // Stale/dead prior owner handoff
+  it("consolidates from stale/dead prior owner regardless of status", async () => {
+    const mockSCM = makeSCM();
+
+    // Prior owner in "spawning" state (stuck/dead)
+    writeMetadata(sessionsDir, "app-stale", {
+      worktree: "/tmp/ws-app-stale",
+      branch: "feat/existing-pr",
+      status: "spawning", // Stuck in spawning
+      project: "my-app",
+      pr: "https://github.com/org/my-app/pull/42",
+      runtimeHandle: JSON.stringify(makeHandle("rt-stale")),
+    });
+
+    writeMetadata(sessionsDir, "app-2", {
+      worktree: "/tmp/ws-app-2",
+      branch: "feat/other",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-2")),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+    const result = await sm.claimPR("app-2", "42");
+
+    // Consolidation happens regardless of prior owner's status
+    expect(result.takenOverFrom).toContain("app-stale");
+    expect(result.pr.number).toBe(42);
+
+    // Prior owner is displaced
+    const staleRaw = readMetadataRaw(sessionsDir, "app-stale");
+    expect(staleRaw!["pr"] ?? "").toBe("");
+    expect(staleRaw!["status"]).toBe("spawning"); // Status unchanged (not a PR-tracking status)
+  });
+
+  // RULE A: Exclusive PR->agent mapping - explicit test
+  it("ensures exclusive PR ownership (only one active owner per PR)", async () => {
+    const mockSCM = makeSCM();
+
+    // First session owns the PR
+    writeMetadata(sessionsDir, "app-owner", {
+      worktree: "/tmp/ws-owner",
+      branch: "feat/existing-pr",
+      status: "pr_open",
+      project: "my-app",
+      pr: "https://github.com/org/my-app/pull/42",
+      runtimeHandle: JSON.stringify(makeHandle("rt-owner")),
+    });
+
+    // Second session wants to claim the same PR
+    writeMetadata(sessionsDir, "app-new", {
+      worktree: "/tmp/ws-new",
+      branch: "feat/other",
+      status: "working",
+      project: "my-app",
+      runtimeHandle: JSON.stringify(makeHandle("rt-new")),
+    });
+
+    const sm = createSessionManager({ config, registry: registryWithSCM(mockSCM) });
+    const result = await sm.claimPR("app-new", "42");
+
+    // New owner succeeds, old owner is displaced
+    expect(result.takenOverFrom).toEqual(["app-owner"]);
+
+    const newOwner = readMetadataRaw(sessionsDir, "app-new");
+    expect(newOwner!["pr"]).toBe("https://github.com/org/my-app/pull/42");
+
+    const oldOwner = readMetadataRaw(sessionsDir, "app-owner");
+    expect(oldOwner!["pr"] ?? "").toBe("");
   });
 });
 
