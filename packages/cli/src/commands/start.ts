@@ -10,8 +10,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import chalk from "chalk";
 import ora from "ora";
 import type { Command } from "commander";
@@ -223,6 +223,7 @@ async function handleUrlStart(
 
   const yamlContent = configToYaml(rawConfig);
   const generatedConfigPath = envConfigPath ?? repoConfigPath;
+  mkdirSync(dirname(generatedConfigPath), { recursive: true });
   writeFileSync(generatedConfigPath, yamlContent);
   spinner.succeed(`Config generated: ${generatedConfigPath}`);
 
