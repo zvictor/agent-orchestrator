@@ -7,6 +7,7 @@ services:
       args:
         AO_INSTALL_AGENTS: ${AO_INSTALL_AGENTS:-claude-code,codex,aider,goose}
     init: true
+    command: ["start"]
     ports:
       - '${AO_PORT:-3000}:3000'
       - '${AO_TERMINAL_PORT:-14800}:14800'
